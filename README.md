@@ -1,7 +1,7 @@
 # ComfyUI_UniBlockSwap
 A universal swap node that supports ComfyUI native workflow, allowing 4_6G users to experience Klein9B or other large models
 
-# Coming soon
+# Update
 * Make it for ' low Vram and normal Ram' users to esay running ComfyUI origin workflows.(Support allmot all of comfyUI origin workflows)
 * Support text encoder or diffusion models, is enable text encoder will need more Ram
 

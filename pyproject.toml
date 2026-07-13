@@ -1,0 +1,15 @@
+[project]
+name = "uniblockswap"
+description = "A universal swap node that supports ComfyUI native workflow, allowing 4_6G users to experience Klein9B or other large models"
+version = "1.0.0"
+license = {file = "LICENSE"}
+
+[project.urls]
+Repository = "https://github.com/smthemex/ComfyUI_UniBlockSwap"
+#  Used by Comfy Registry https://registry.comfy.org
+
+[tool.comfy]
+PublisherId = "smthemex"
+DisplayName = "ComfyUI_UniBlockSwap"
+Icon = ""
+includes = []
