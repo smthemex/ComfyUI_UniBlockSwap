@@ -6,6 +6,8 @@ A universal swap node that supports ComfyUI native workflow, allowing 4_6G users
 * When num block is -1, unload a single block. When it is 0, turn off the swap function. When it is greater than 0, cache the corresponding number of block values to CUDA. When it is greater than or equal to the total block, turn off the swap (equivalent to 0) ；  
 
 # Update
+* 修复minimax music 的te模式出错的问题，因为机制的修改，推理速度不一定比原生的快（只是为了方便极低显存用户）  
+* Fix the issue of TE mode error in minimax music, as the inference speed may not be faster than native due to mechanism modifications (only for the convenience of extremely low memory users)   
 * num block的机制改成预缓存机制，调大后，gpu会预缓存对应数值的block（修复改动num block值导致lora失效的挂载bug）；
 * Change the mechanism of num block to a pre caching mechanism. After scaling up, the GPU will pre cache the corresponding block values (fix the mounting bug where changing the num block value caused lora to fail);  
 * ~~fix lora unuseful's bug  修复lora失效的bug，新增节点清理TE（如果推理完第一次，再次修改提示词会导致显存占用，详看插件工作流）~~
@@ -22,6 +24,8 @@ git clone https://github.com/smthemex/ComfyUI_UniBlockSwap
 ```
 
 # Example
+* minimax music text encoder
+![](https://github.com/smthemex/ComfyUI_UniBlockSwap/blob/main/example_workflows/example_music.png)
 * run minimax H3 5min 0.4 just need 4.5G Vram (要降低Te的占用需要加te模块,或者用comfyUI自带的Vbar,OOM再加TE swap,避免内存占用)
 ![](https://github.com/smthemex/ComfyUI_UniBlockSwap/blob/main/example_workflows/example_minimax.png)
 ![](https://github.com/smthemex/ComfyUI_UniBlockSwap/blob/main/example_workflows/minimax.png)
