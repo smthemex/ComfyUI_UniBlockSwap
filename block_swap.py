@@ -39,6 +39,7 @@ import gc
 import logging
 import torch
 import torch.nn as nn
+import comfy
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +455,388 @@ def install_block_swap(diffusion_model, compute_device, offload_device,
     return first_swl, cleanup, all_names, all_swls
 
 
+def install_minimax_music_swap(cond_stage_model, compute_device, offload_device,
+                                num_blocks=-1):
+    """Install a dedicated MiniMax Music3T block-swap that re-implements
+    `MiniMaxMusic3AR.generate` WITHOUT ComfyUI's native vbar / CUDA-graph
+    machinery.
+
+    Why a re-implemented generate instead of forward-wrapping:
+      - Native swap for other TEs wraps `forward` and extracts patches as weights
+        to control per-block CUDA residency. That works because those TEs run a
+        single `self.model(...)` forward.
+      - MiniMax Music3T is autoregressive: `generate` loops frame-by-frame and
+        calls `prefetch_queue_pop(enable_graph=True)` to capture the audio decoder
+        inside a CUDA graph. Wrapping forward (and the per-forward offload +
+        synchronize) collides with graph capture -> cudaErrorStreamCaptureInvalidated.
+      - So we do NOT wrap forward and do NOT touch the native vbar path. We
+        monkey-patch `generate` with a version that manually moves each AR layer
+        (and the depth decoder) into CUDA right before use and offloads it right
+        after, respecting a fixed-resident prefix of `num_blocks` layers.
+
+    The re-implemented generate mirrors the original logic (seed derivation,
+    CFG, sampling, KV cache, fixed_kv, freqs_cis, norm) but substitutes plain
+    `blk.to(compute_device)` / `_restore_*_refs` for the prefetch queue.
+
+    Returns (mgr_list, cleanup, container_names). mgr_list holds a small
+    bookkeeping object (not a SwappableModuleList) used by cleanup.
+    """
+    model = getattr(cond_stage_model, "model", None)
+    if model is None or not hasattr(model, "layers") or not hasattr(model, "audio_decoder"):
+        logger.info("UniBlockSwapTE: MiniMax Music3T - nothing to swap (no layers/decoder)")
+        return [], lambda: None, set()
+
+    layers = model.layers
+    total = len(layers)
+    if total == 0:
+        return [], lambda: None, set()
+
+    # num_blocks -> leading layers kept resident in CUDA for the whole generate.
+    win = num_blocks if num_blocks > 0 else 1
+    win = max(1, min(win, total))
+    if num_blocks > 0 and win >= total:
+        logger.info("UniBlockSwapTE: MiniMax Music3T = %d layers, NO swap (num_blocks=%d >= total)",
+                     total, num_blocks)
+        return [], lambda: None, set()
+
+    logger.info("UniBlockSwapTE: MiniMax Music3T = %d AR layers, resident prefix = %d, "
+                "tail swapped per-layer/per-frame (num_blocks=%d); vbar/graph path bypassed",
+                total, win, num_blocks)
+
+    # --- helper closures: bring a block onto CUDA, / release it back to CPU ---
+    # Layer swap model (no vbar, no graph):
+    #   * non-layer modules (decoder, extra_embedding, KV cache, norm, embed,
+    #     lm_head) are RESIDENT on CUDA for the whole generate.
+    #   * AR layers: each frame, a layer is H2D-copied from the CPU-resident
+    #     model (the single source of truth in host memory) onto CUDA, run, then
+    #     RELEASED back to CPU. We do NOT keep a CPU<->CUDA pointer backup; the
+    #     host copy is the truth and the next layer simply re-copies. This keeps
+    #     peak VRAM = resident parts + sliding window of layers, at the cost of
+    #     one H2D copy per layer per frame (the price of low-VRAM swap).
+    def _load_block(blk):
+        """Copy a block's weights from host memory onto CUDA (H2D)."""
+        try:
+            if _is_gguf_block(blk):
+                _backup_ggml_refs(blk)  # mmap-backed: keep metadata, move onto CUDA
+                blk.to(compute_device)
+            else:
+                if not _has_meta_params(blk):
+                    blk.to(compute_device)
+        except Exception as e:
+            logger.warning("UniBlockSwapTE: MiniMax load block failed (%s)", e)
+
+    def _offload_block(blk):
+        """Release a block's CUDA weights back to host memory (frees VRAM).
+        For safetensor the host copy is the truth, so a plain .to(offload) is
+        enough; for GGUF we must restore the mmap-backed pointers."""
+        try:
+            if _is_gguf_block(blk):
+                _restore_ggml_refs(blk)
+            else:
+                blk.to(offload_device)
+        except Exception:
+            pass
+
+    # Resident prefix: blocks 0..win-1 are pushed onto CUDA ONCE and stay for
+    # the whole generate (optional optimization: win layers never re-copy).
+    # Tail layers (>= win) are NOT loaded here - they are H2D-copied inside the
+    # frame loop and released right after, keeping VRAM low.
+    # GGUF prefix blocks need their refs backed up; safetensor prefix blocks are
+    # plain .to(cuda) (released by pointer/restore on cleanup).
+    prefix = []
+    for i in range(win):
+        blk = layers[i]
+        if _is_gguf_block(blk):
+            _backup_ggml_refs(blk)
+        if not _has_meta_params(blk):
+            blk.to(compute_device)
+        prefix.append(blk)
+
+    # Non-layer modules: RESIDENT on CUDA for the whole generate (per user spec).
+    decoder = model.audio_decoder
+    audio_extra_embedding = model.audio_extra_embedding
+    _load_block(decoder)
+    _load_block(audio_extra_embedding)
+
+    original_generate = cond_stage_model.generate
+
+    mgr = {
+        "cond_stage_model": cond_stage_model,
+        "model": model,
+        "layers": layers,
+        "total": total,
+        "prefix": prefix,
+        "win": win,
+        "decoder": decoder,
+        "audio_extra_embedding": audio_extra_embedding,
+        "compute_device": compute_device,
+        "offload_device": offload_device,
+        "_load_block": _load_block,
+        "_offload_block": _offload_block,
+        "_is_gguf_block": _is_gguf_block,
+    }
+
+    # --- re-implemented generate (no vbar / no CUDA graph) ---
+    from comfy.ldm.minimax_music.ar import (
+        derive_seed, sample_topk, CFG_SCALE, CFG_TOP_K, MAX_AUDIO_FRAMES,
+        MAX_PROMPT_TOKENS, AUDIO_CODE_OFFSET, C0_VOCAB_SIZE,
+    )
+    from comfy.ldm.minimax_music.prompt import SPECIAL_TOKEN_IDS
+    from comfy.text_encoders.llama import FixedKV  # module-level class
+
+    def _is_fixed_kv(kv):
+        return hasattr(kv, "prepare") and hasattr(kv, "advance")
+
+    def _load_layer(i):
+        # Prefix blocks (i < win) are RESIDENT: returned as-is, zero transfer.
+        # Tail blocks (>= win) are H2D-copied from host memory onto CUDA now,
+        # run, and released by _offload_layer right after this frame. The module
+        # object itself is layers[i]; _load_block only moves its weights, so we
+        # return layers[i] (NOT _load_block's None return).
+        if i < win:
+            return prefix[i]
+        _load_block(layers[i])
+        return layers[i]
+
+    def _offload_layer(i, blk):
+        # Only tail blocks are released back to host (frees VRAM). Prefix blocks
+        # stay resident for the whole generate.
+        if i < win:
+            return
+        _offload_block(blk)
+
+    def _ar_forward(embeds, past_key_values, dtype):
+        """Manual re-implementation of Llama2_.forward without prefetch queue /
+        CUDA graph.
+
+        Layer swap model (no vbar):
+          * Prefix blocks (0..win-1) are resident on CUDA (loaded once at
+            install, never re-copied during the loop).
+          * Tail blocks (>= win) are H2D-copied from host memory onto CUDA for
+            THIS layer, run, then released back to host immediately - so peak
+            VRAM only holds the resident prefix plus the layer(s) currently in
+            flight. This is the low-VRAM behavior, paid for with one H2D copy
+            per tail layer per frame.
+          * Non-layer modules (decoder, extra_embedding, KV cache, norm, embed,
+            lm_head) are resident on CUDA for the whole generate.
+
+        Returns (x, next_key_values) mirroring original forward (output[0] = last
+        hidden, output[2] = next_key_values).
+        """
+        x = embeds
+        seq_len = x.shape[1]
+        past_len = 0
+        if past_key_values is not None and len(past_key_values) > 0:
+            first = past_key_values[0]
+            past_len = first.index if _is_fixed_kv(first) else first[2]
+
+        import torch as _torch
+        position_ids = _torch.arange(past_len, past_len + seq_len, device=x.device).unsqueeze(0)
+        freqs_cis = model.compute_freqs_cis(position_ids, x.device)
+
+        mask = None
+        if seq_len > 1:
+            causal_mask = _torch.empty(past_len + seq_len, past_len + seq_len,
+                                       dtype=x.dtype, device=x.device).fill_(
+                _torch.finfo(x.dtype).min / 4).triu_(1)
+            mask = causal_mask
+
+        from comfy.ldm.modules.attention import optimized_attention_for_device
+        optimized_attention = optimized_attention_for_device(
+            x.device, mask=mask is not None, small_input=True)
+
+        fixed_kv = past_key_values is not None and len(past_key_values) > 0 and \
+            _is_fixed_kv(past_key_values[0])
+
+        next_key_values = list(past_key_values) if past_key_values is not None else []
+        loaded = []
+        for i in range(total):
+            blk = _load_layer(i)
+            loaded.append((i, blk))
+            past_kv = past_key_values[i] if past_key_values is not None and len(past_key_values) > 0 else None
+            if fixed_kv:
+                past_kv.prepare(seq_len)
+            x, current_kv = blk(
+                x=x,
+                attention_mask=mask,
+                freqs_cis=freqs_cis,
+                optimized_attention=optimized_attention,
+                past_key_value=past_kv,
+            )
+            if next_key_values:
+                next_key_values[i] = current_kv
+            if fixed_kv:
+                next_key_values[i].advance(seq_len)
+            # release tail layer back to host immediately (prefix stays)
+            _offload_layer(i, blk)
+
+        if model.norm is not None:
+            x = model.norm(x)
+        return x, next_key_values
+
+    def swap_generate(self, input_ids, seed, max_audio_frames, device,
+                      cfg_scale=CFG_SCALE, top_k=CFG_TOP_K):
+        prompt_tokens = int(input_ids.shape[1])
+        if prompt_tokens > MAX_PROMPT_TOKENS:
+            raise ValueError(f"MiniMax Music3 prompt has {prompt_tokens} tokens; maximum is {MAX_PROMPT_TOKENS}")
+
+        import torch as _torch
+        input_ids = input_ids.to(device)
+        if comfy.model_management.should_use_bf16(device):
+            execution_dtype = _torch.bfloat16
+        else:
+            execution_dtype = _torch.float32
+        unconditioned = input_ids.clone()
+        unconditioned[:, 1:-2] = SPECIAL_TOKEN_IDS["<|audio_cfg|>"]
+        text_ids = _torch.cat((input_ids, unconditioned), dim=0)
+        if model.pruned_embedding:
+            text_embeds = model.embed_tokens_prefill(text_ids, out_dtype=execution_dtype)
+        else:
+            text_embeds = model.embed_tokens(text_ids, out_dtype=execution_dtype)
+        decode_limit = min(int(max_audio_frames), MAX_AUDIO_FRAMES)
+        past = model.init_kv_cache(2, prompt_tokens + decode_limit + 1, device, execution_dtype)
+
+        # prefill: full sequence through AR layers (no graph)
+        out = _ar_forward(text_embeds, past, execution_dtype)
+        last_hidden = out[0][:, -1]
+        past = out[1]
+
+        generator = _torch.Generator(device=device).manual_seed(derive_seed(seed, "ar"))
+        depth_io = {
+            "hidden": _torch.empty_like(last_hidden),
+            "c0": _torch.empty((last_hidden.shape[0],), dtype=_torch.long, device=device),
+            "c0_embed": _torch.empty_like(last_hidden),
+            "codes": _torch.empty((last_hidden.shape[0], self.num_codebooks), dtype=_torch.long, device=device),
+            "depth_hidden": _torch.empty((1, last_hidden.shape[-1] * (self.num_codebooks - 1)),
+                                        dtype=execution_dtype, device=device),
+        }
+        decoder._comfy_cross_step_state = depth_io
+        comfy.model_management._register_cross_step(decoder)
+
+        hidden_frames = []
+        pending_code = None
+        stop_token = None
+        pending_event = None
+        pending_hidden = None
+        progress = comfy.utils.ProgressBar(decode_limit)
+        cuda_device = _torch.device(device).type == "cuda"
+        vocab_mask = None
+        if not model.pruned_lm_head:
+            vocab_mask = _torch.ones(model.vocab_size, dtype=_torch.bool, device=device)
+            vocab_mask[AUDIO_CODE_OFFSET:AUDIO_CODE_OFFSET + C0_VOCAB_SIZE] = False
+            vocab_mask[SPECIAL_TOKEN_IDS["<|audio_end|>"]] = False
+
+        # depth core: decoder + extra embedding are RESIDENT on CUDA (loaded
+        # once before the loop), so no per-frame transfer here. No graph.
+        def depth_core():
+            codes, depth_hidden = self._depth_codes(
+                depth_io["hidden"], depth_io["c0"], depth_io["c0_embed"],
+                generator, execution_dtype, cfg_scale, top_k)
+            depth_io["codes"].copy_(codes)
+            depth_io["depth_hidden"].copy_(depth_hidden)
+
+        for frame_index in comfy.utils.model_trange(decode_limit + 1, desc="AR sampling"):
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            if pending_code is not None:
+                if pending_event is not None:
+                    pending_event.synchronize()
+                if int(pending_code.item()) == stop_token:
+                    pending_hidden = None
+                    break
+                if pending_hidden is not None:
+                    hidden_frames.append(pending_hidden)
+                    progress.update_absolute(len(hidden_frames))
+                    if len(hidden_frames) >= decode_limit:
+                        break
+
+            c0, code_or_stop, stop_token = self._sample_c0(last_hidden, cfg_scale, top_k, generator, vocab_mask)
+            if pending_code is None:
+                pending_code = _torch.empty_like(code_or_stop, device="cpu", pin_memory=cuda_device)
+                if cuda_device:
+                    pending_event = _torch.cuda.Event()
+            pending_code.copy_(code_or_stop, non_blocking=cuda_device)
+            if pending_event is not None:
+                pending_event.record()
+
+            c0 = c0.repeat(2)
+            c0_embed = self._embed_c0(c0, execution_dtype)
+            depth_io["hidden"].copy_(last_hidden)
+            depth_io["c0"].copy_(c0)
+            depth_io["c0_embed"].copy_(c0_embed)
+
+            depth_core()
+
+            feedback_codes = depth_io["codes"]
+            depth_hidden = depth_io["depth_hidden"]
+            frame_hidden = _torch.cat((last_hidden[:1].detach(), depth_hidden), dim=-1)
+            if frame_index > 0:
+                pending_hidden = frame_hidden[0].clone()
+
+            feedback = self._embed_audio_frame(feedback_codes, execution_dtype)
+            out = _ar_forward(feedback, past, execution_dtype)
+            last_hidden = out[0][:, -1]
+            past = out[1]
+
+        if pending_hidden is not None and len(hidden_frames) < decode_limit:
+            if pending_event is not None:
+                pending_event.synchronize()
+            if int(pending_code.item()) != stop_token:
+                hidden_frames.append(pending_hidden)
+
+        if not hidden_frames:
+            raise ValueError("MiniMax Music3 generated zero audio frames")
+        return _torch.stack(hidden_frames).to(device="cpu")
+
+    cond_stage_model.generate = swap_generate.__get__(cond_stage_model, type(cond_stage_model))
+
+    def cleanup():
+        # Restore original generate and release all GPU-resident blocks.
+        try:
+            cond_stage_model.generate = original_generate
+        except Exception:
+            pass
+        # Release every layer (resident prefix + any tail left on GPU from an
+        # interrupted frame) back to host memory. Decoder + extra_embedding were
+        # loaded resident before the loop, so they are released here too.
+        for i in range(total):
+            _offload_block(layers[i])
+        _offload_block(decoder)
+        _offload_block(audio_extra_embedding)
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    container_names = {"layers"}
+    return [mgr], cleanup, container_names
+
+
+def _is_minimax_music_te(cond_stage_model):
+    """Detect the MiniMax Music3T text encoder.
+
+    MiniMax Music3T (MiniMaxMusic3TEModel / MiniMaxMusic3AR) wraps an
+    autoregressive Qwen3-style transformer (self.model) plus an RVQ depth
+    decoder (self.model.audio_decoder). Its AR sampling loop runs the audio
+    decoder inside a CUDA graph capture
+    (comfy/model_prefetch.prefetch_queue_pop(..., enable_graph=True)), which
+    forbids non-pinned CPU->CUDA copies and stream synchronization during
+    capture. Block swap's per-forward offload + synchronize is therefore
+    incompatible: it would break the capture and abort the process.
+
+    Returns True only for this architecture. Gemma4Transformer also sets
+    graph_dynamic_vbar_blocks/prefetch_dynamic_vbars, but has no
+    audio_decoder, so it is NOT matched here.
+    """
+    try:
+        if type(cond_stage_model).__name__ == "MiniMaxMusic3TEModel":
+            return True
+        model = getattr(cond_stage_model, "model", None)
+        if model is not None and hasattr(model, "audio_decoder"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def find_te_containers(cond_stage_model):
     results = []
     seen_ids = set()
@@ -479,6 +862,18 @@ def find_te_containers(cond_stage_model):
 
 def install_te_block_swap(cond_stage_model, compute_device, offload_device,
                           num_blocks=-1):
+    # MiniMax Music3T dedicated branch: its autoregressive AR loop captures the
+    # audio decoder in a CUDA graph (model_prefetch.prefetch_queue_pop with
+    # enable_graph=True). Block swap is incompatible with graph capture (weight
+    # transfers + synchronize are forbidden while capturing), so the whole TE
+    # is excluded from swap and keeps ComfyUI's native vbar + CUDA graph path.
+    # Other text encoders (Krea2, Gemma4, ...) are unaffected.
+    if _is_minimax_music_te(cond_stage_model):
+        logger.info("UniBlockSwapTE: MiniMax Music3T detected - CUDA graph "
+                    "capture on the audio decoder is incompatible with block "
+                    "swap; skipping TE swap (native vbar prefetch kept)")
+        return [], lambda: None, set()
+
     containers = find_te_containers(cond_stage_model)
 
     if not containers:
