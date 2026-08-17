@@ -4,7 +4,10 @@ import comfy.model_management as mm
 import comfy.patcher_extension
 import gc
 import uuid
-from .block_swap import install_block_swap, install_te_block_swap, _restore_ggml_refs, _restore_param_refs, _is_gguf_block
+from .block_swap import (
+    install_block_swap, install_te_block_swap, install_minimax_music_swap,
+    _restore_ggml_refs, _restore_param_refs, _is_gguf_block, _is_minimax_music_te,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -365,6 +368,35 @@ class UniBlockSwapTE:
         cond_stage = _get_cond_stage_model(new_clip)
         if cond_stage is None:
             logger.warning("UniBlockSwapTE: no cond_stage_model found")
+            return (new_clip,)
+
+        # MiniMax Music3T dedicated branch: re-implement generate WITHOUT the
+        # native vbar / CUDA-graph machinery (see install_minimax_music_swap in
+        # block_swap.py). The AR loop is not a single forward, so the normal
+        # forward-wrapping swap cannot apply. We manually move each AR layer and
+        # the depth decoder into CUDA per step and offload after.
+        if _is_minimax_music_te(cond_stage):
+            compute = new_clip.patcher.load_device
+            offload = new_clip.patcher.offload_device
+            mgr_list, cleanup, container_names = install_minimax_music_swap(
+                cond_stage, compute, offload, num_blocks=num_blocks)
+            if not mgr_list:
+                logger.info("UniBlockSwapTE: MiniMax Music3T - nothing to swap")
+                return (new_clip,)
+            new_clip.patcher.model._uniblockswap_te_cleanup = cleanup
+
+            def _ensure_offloaded():
+                try:
+                    cleanup()
+                except Exception:
+                    pass
+
+            new_clip.patcher.add_callback_with_key(
+                comfy.patcher_extension.CallbacksMP.ON_CLEANUP,
+                "UniBlockSwapTE-MiniMax", lambda p: _ensure_offloaded())
+
+            logger.info("UniBlockSwapTE: MiniMax Music3T swap installed "
+                        "(bypass vbar/graph); num_blocks=%s", num_blocks)
             return (new_clip,)
 
         # Re-entry guard: clip.clone() shares the same underlying model object.
