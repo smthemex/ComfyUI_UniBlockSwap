@@ -6,6 +6,7 @@ A universal swap node that supports ComfyUI native workflow, allowing 4_6G users
 * When num block is -1, unload a single block. When it is 0, turn off the swap function. When it is greater than 0, cache the corresponding number of block values to CUDA. When it is greater than or equal to the total block, turn off the swap (equivalent to 0) ；  
 
 # Update
+* Fix if comfyUI version>=0.35 swap failed. 当comfyUI 的版本大于0.35时，因为如果未禁用dynamic会导致swap失效，此次更新主要是在使用此插件时（节点启用），临时关闭dynamic.当然，新版的dynamic机制也类似swap（但是内存占用奇高，且推理一次读一次硬盘），此插件主要是目的是极限压制显存占用，不让模型共享显存。
 * 修复minimax music 的te模式出错的问题，因为机制的修改，推理速度不一定比原生的快（只是为了方便极低显存用户）  
 * Fix the issue of TE mode error in minimax music, as the inference speed may not be faster than native due to mechanism modifications (only for the convenience of extremely low memory users)   
 * num block的机制改成预缓存机制，调大后，gpu会预缓存对应数值的block（修复改动num block值导致lora失效的挂载bug）；
