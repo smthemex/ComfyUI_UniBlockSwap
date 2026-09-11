@@ -8,8 +8,13 @@ from .block_swap import (
     install_block_swap, install_te_block_swap, install_minimax_music_swap,
     _restore_ggml_refs, _restore_param_refs, _is_gguf_block, _is_minimax_music_te,
 )
+from .legacy_vram import runtime_report, description_suffix
 
 logger = logging.getLogger(__name__)
+
+# ComfyUI >= 0.35: DynamicVRAM bypass state. mode=auto (default) only engages
+# when a workflow actually uses one of these nodes (see legacy_vram.py).
+_LEGACY_SUFFIX = description_suffix()
 
 
 def _get_diffusion_model(patcher):
@@ -200,7 +205,8 @@ class UniBlockSwap:
     RETURN_NAMES = ("model",)
     FUNCTION = "apply_swap"
     CATEGORY = "model/loaders"
-    DESCRIPTION = "前缀常驻 swap: 前 num_blocks 个 block 一次性推入 CUDA 常驻到推理结束, 其余块逐块懒加载, 降低显存。"
+    DESCRIPTION = ("前缀常驻 swap: 前 num_blocks 个 block 一次性推入 CUDA 常驻到推理结束, "
+                   "其余块逐块懒加载, 降低显存。" + _LEGACY_SUFFIX)
 
     # NOTE: no IS_CHANGED on purpose. apply_swap() is a one-time install step
     # (wraps the shared model object in SwappableModuleList + attaches LoRA
@@ -209,6 +215,10 @@ class UniBlockSwap:
     # Per-inference VRAM cleanup of TE/VAE is handled by the separate
     # UniBlockSwapCacheControl node, which re-runs every inference.
     def apply_swap(self, model, num_blocks=-1):
+        # ComfyUI >= 0.35: tell the user whether the DynamicVRAM bypass is live
+        # (the switch is flipped by the /prompt gate before any model is built,
+        # see legacy_vram.py).
+        runtime_report("UniBlockSwap", model)
         if num_blocks == 0:
             return (model,)
 
@@ -356,11 +366,15 @@ class UniBlockSwapTE:
     RETURN_NAMES = ("clip",)
     FUNCTION = "apply_swap"
     CATEGORY = "model/loaders"
-    DESCRIPTION = "前缀常驻 swap 文本编码器 block: 前 num_blocks 个 block 常驻 CUDA 到本次推理结束, 其余块逐块懒加载。"
+    DESCRIPTION = ("前缀常驻 swap 文本编码器 block: 前 num_blocks 个 block 常驻 CUDA 到本次推理结束, "
+                   "其余块逐块懒加载。" + _LEGACY_SUFFIX)
 
     # NOTE: no IS_CHANGED on purpose (see UniBlockSwap comment). Per-inference
     # VRAM cleanup of the text encoder is handled by UniBlockSwapCacheControl.
     def apply_swap(self, clip, num_blocks=-1):
+        # ComfyUI >= 0.35: report the DynamicVRAM bypass state (the switch is
+        # flipped by the /prompt gate before any model is built, see legacy_vram.py).
+        runtime_report("UniBlockSwapTE", getattr(clip, "patcher", None))
         if num_blocks == 0:
             return (clip,)
 
